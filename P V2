@@ -68,7 +68,8 @@ def build_unet(input_shape):
     dropoutRate = 0.1  # Dropout 機率
 
     # 編碼器（Encoder）
-    conv1 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='RandomNormal',padding='same')(input_layer) # 第一層2D卷積層，64個大小為3x3的濾波器，主要學習特徵圖，
+    # 第一層2D卷積層，64個大小為3x3的濾波器，主要學習特徵圖
+    conv1 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='RandomNormal',padding='same')(input_layer) 
     # relu將負數設為0，有助於加快訓練模型速度，輸入影像與輸出影像的大小將保持一致，並在邊界填充零值才能被整除，並生成 64 個新的特徵圖
     conv1 = Dropout(dropoutRate)(conv1)
     conv1 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='RandomNormal',padding='same')(conv1)
