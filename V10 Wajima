@@ -1,0 +1,891 @@
+import os
+import cv2
+import numpy as np
+import rasterio
+import pandas as pd
+import tensorflow as tf
+from patchify import patchify, unpatchify
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv2D, Conv2DTranspose, MaxPooling2D, Concatenate, Dropout
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import save_img
+import itertools
+from osgeo import gdal, osr
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from skimage.transform import resize
+from skimage.feature import SIFT
+from skimage.measure import ransac
+from skimage.transform import AffineTransform
+
+# 讀取多波段影像的函數
+def read_multiband_image(image_path):
+    with rasterio.open(image_path) as src:
+        bands = src.read()  # 讀取所有波段
+        image = np.moveaxis(bands, 0, -1)  # 將波段維度移到最後
+    return image, src.transform
+
+def read_mask(mask_path):
+    with rasterio.open(mask_path) as src:
+        mask = src.read(1) # 只讀取第一個波段作為遮罩
+    return mask
+
+def normalize_image(image):
+    normalized_image = np.zeros_like(image, dtype=np.float32)
+    
+    # 對每個波段分別進行正規化
+    for band in range(image.shape[-1]):
+        band_data = image[..., band]
+        band_min = np.min(band_data)
+        band_max = np.max(band_data)
+        
+        # 避免除以零
+        if band_max > band_min:
+            normalized_image[..., band] = (band_data - band_min) / (band_max - band_min)
+        else:
+            normalized_image[..., band] = band_data
+            
+    return normalized_image
+
+    
+def extract_features(image):
+    """提取影像特徵點"""
+    # 檢查影像是否為空
+    if image is None:
+        print("錯誤：影像無法讀取或為空")
+        return None, None
+    
+    # 確保影像是 uint8 類型
+    if image.dtype != np.uint8:
+        image = image.astype(np.uint8)
+    
+    # 檢查影像的通道數
+    if len(image.shape) == 3:
+        # 如果是多通道影像，選擇紅色通道或將影像轉為灰度
+        if image.shape[2] == 8:  # 假設影像是 8 通道
+            # 只選取紅色通道，或者可以選擇其他通道
+            gray = image[:, :, 0]  # 使用紅色通道作為灰度圖
+        else:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image  # 如果已經是灰度圖
+
+    # 使用 SIFT 檢測特徵點
+    sift = cv2.SIFT_create()
+    keypoints, descriptors = sift.detectAndCompute(gray, None)
+    
+    return keypoints, descriptors
+
+def match_features(desc1, desc2):
+    """匹配特徵點"""
+    # 使用 FLANN 匹配器
+    FLANN_INDEX_KDTREE = 1
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    
+    matches = flann.knnMatch(desc1, desc2, k=2)
+    
+    # Lowe's ratio test
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.7 * n.distance:
+            good_matches.append(m)
+            
+    return good_matches
+
+def align_image(img_to_align, ref_img):
+    """將一張影像對齊到參考影像"""
+    # 提取特徵點
+    kp1, des1 = extract_features(ref_img)
+    kp2, des2 = extract_features(img_to_align)
+    
+    if des1 is None or des2 is None:
+        print("無法檢測到足夠的特徵點，使用簡單的大小調整")
+        return cv2.resize(img_to_align, (ref_img.shape[1], ref_img.shape[0]))
+    
+    # 匹配特徵點
+    matches = match_features(des1, des2)
+    
+    if len(matches) < 4:
+        print("匹配點太少，使用簡單的大小調整")
+        return cv2.resize(img_to_align, (ref_img.shape[1], ref_img.shape[0]))
+    
+    # 獲取匹配點的座標
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 2)
+    
+    # 使用 RANSAC 估計變換矩陣
+    transform_matrix, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+    
+    if transform_matrix is None:
+        print("無法估計變換矩陣，使用簡單的大小調整")
+        return cv2.resize(img_to_align, (ref_img.shape[1], ref_img.shape[0]))
+    
+    # 應用變換
+    aligned_img = cv2.warpAffine(img_to_align, transform_matrix, 
+                                 (ref_img.shape[1], ref_img.shape[0]))
+    
+    return aligned_img
+
+def align_png_images(original_image, google_png, gsi_png, patch_size=32):
+
+    # 確保參考影像大小合適
+    target_height = (original_image.shape[0] // patch_size) * patch_size
+    target_width = (original_image.shape[1] // patch_size) * patch_size
+    
+    # 調整參考影像大小
+    ref_image = cv2.resize(original_image, (target_width, target_height))
+    
+    # 對齊 Google Maps 影像
+    print("正在對齊 Google Maps 影像...")
+    aligned_google = align_image(google_png, ref_image)
+    
+    # 對齊 GSI 影像
+    print("正在對齊 GSI 影像...")
+    aligned_gsi = align_image(gsi_png, ref_image)
+    
+    # 後處理：確保所有影像具有相同的大小和格式
+    def post_process(img):
+        # 確保大小一致
+        img = cv2.resize(img, (target_width, target_height))
+        # 正規化到 0-1 範圍
+        img = img.astype(np.float32) / 255.0
+        return img
+    
+    aligned_google = post_process(aligned_google)
+    aligned_gsi = post_process(aligned_gsi)
+    
+    return ref_image, aligned_google, aligned_gsi
+
+def process_patches(patches_pre_img, patches_post_img, patches_mask):
+    patchsize = 32
+    # Initialize arrays with correct shapes
+    X = np.zeros((patches_pre_img.shape[0], patches_pre_img.shape[1], 
+                  patchsize, patchsize, patches_pre_img.shape[-1]))
+    y = np.zeros((patches_mask.shape[0], patches_mask.shape[1], 
+                  patchsize, patchsize))
+    original_patches = []
+
+    for i in range(patches_pre_img.shape[0]):
+        for j in range(patches_post_img.shape[1]):
+            patch_pre = patches_pre_img[i, j, 0]
+            patch_post = patches_post_img[i, j, 0]
+
+            # 檢查正規化後的範圍
+            print("原災前範圍:", patch_pre.min(), patch_pre.max())
+            print("原災後範圍:", patch_post.min(), patch_post.max())
+            
+            # 儲存原始的災前影像patch用於視覺化
+            original_patch = patch_pre.copy()
+            original_patches.append(original_patch)
+            
+            # 計算差值
+            patch_diff = patch_post - patch_pre
+            
+            # 正規化處理
+            patch_pre_normalized = (patch_pre - patch_pre.min()) / (patch_pre.max() - patch_pre.min())
+            patch_post_normalized = (patch_post - patch_post.min()) / (patch_post.max() - patch_post.min())
+            patch_diff_normalized = (patch_diff - patch_diff.min()) / (patch_diff.max() - patch_diff.min())
+
+            # 檢查正規化後的範圍
+            print("正規化後災前像素範圍:", patch_pre_normalized.min(), patch_pre_normalized.max())
+            print("正規化後災後像素範圍:", patch_post_normalized.min(), patch_post_normalized.max())
+            print("正規化後差值範圍:", patch_diff_normalized.min(), patch_diff_normalized.max())
+
+            # Store the normalized difference in X
+            X[i, j] = patch_diff_normalized
+            y[i, j] = patches_mask[i, j]
+
+            # Print sample statistics every 100 patches
+            if (i * patches_post_img.shape[1] + j) % 100 == 0:
+                print(f"Sample {i * patches_post_img.shape[1] + j}:")
+                print(f"X range: [{patch_diff_normalized.min():.2f}, {patch_diff_normalized.max():.2f}]")
+                print(f"y range: [{patches_mask[i, j].min():.2f}, {patches_mask[i, j].max():.2f}]")
+
+    # Reshape X and y to match the expected input format
+    X = X.reshape(-1, patchsize, patchsize, patches_pre_img.shape[-1])
+    y = y.reshape(-1, patchsize, patchsize)
+    original_patches = np.array(original_patches)
+
+    return X, y, original_patches
+
+def reconstruct_predictions(predictions, original_shape, patchsize):
+    h, w = original_shape[:2]
+    # 計算補丁數量
+    h_patches = original_shape[0] // patchsize
+    w_patches = original_shape[1] // patchsize
+    needed_predictions = h_patches * w_patches
+    
+    # 確保預測結果數量正確
+    predictions = predictions[:needed_predictions]
+    
+    try:
+        # 重塑為補丁形式
+        predictions_reshaped = predictions.reshape(h_patches, w_patches, patchsize, patchsize)
+        
+        # 使用 unpatchify 重建完整預測遮罩
+        reconstructed = unpatchify(predictions_reshaped, (original_shape[0], original_shape[1]))
+        
+        return reconstructed
+    
+    except ValueError as e:
+        print(f"重建錯誤: {e}")
+        print(f"預測形狀: {predictions.shape}")
+        print(f"目標形狀: ({h_patches}, {w_patches}, {patchsize}, {patchsize})")
+        print(f"需要的預測數量: {needed_predictions}")
+        raise
+
+def build_unet(input_shape):
+    input_layer = Input(shape=input_shape)
+    dropoutRate = 0.1
+
+    # 編碼器
+    conv1 = Conv2D(16, (3, 3), activation='relu', padding='same')(input_layer)
+    conv1 = Dropout(dropoutRate)(conv1)
+    conv1 = Conv2D(16, (3, 3), activation='relu', padding='same')(conv1)
+    pool1 = MaxPooling2D(pool_size=(2, 2))(conv1)
+
+    conv2 = Conv2D(32, (3, 3), activation='relu', padding='same')(pool1)
+    conv2 = Dropout(dropoutRate)(conv2)
+    conv2 = Conv2D(32, (3, 3), activation='relu', padding='same')(conv2)
+    pool2 = MaxPooling2D(pool_size=(2, 2))(conv2)
+
+    conv3 = Conv2D(64, (3, 3), activation='relu', padding='same')(pool2)
+    conv3 = Dropout(dropoutRate)(conv3)
+    conv3 = Conv2D(64, (3, 3), activation='relu', padding='same')(conv3)
+    pool3 = MaxPooling2D(pool_size=(2, 2))(conv3)
+
+    conv4 = Conv2D(128, (3, 3), activation='relu', padding='same')(pool3)
+    conv4 = Dropout(dropoutRate)(conv4)
+    conv4 = Conv2D(128, (3, 3), activation='relu', padding='same')(conv4)
+    pool4 = MaxPooling2D(pool_size=(2, 2))(conv4)
+
+    # 橋接層
+    conv5 = Conv2D(256, (3, 3), activation='relu', padding='same')(pool4)
+    conv5 = Dropout(dropoutRate)(conv5)
+    conv5 = Conv2D(256, (3, 3), activation='relu', padding='same')(conv5)
+
+    # 解碼器
+    u6 = Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(conv5)
+    u6 = Concatenate()([u6, conv4])
+    c6 = Conv2D(128, (3, 3), activation='relu', padding='same')(u6)
+    c6 = Dropout(dropoutRate)(c6)
+    c6 = Conv2D(128, (3, 3), activation='relu', padding='same')(c6)
+
+    u7 = Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(c6)
+    u7 = Concatenate()([u7, conv3])
+    c7 = Conv2D(64, (3, 3), activation='relu', padding='same')(u7)
+    c7 = Dropout(dropoutRate)(c7)
+    c7 = Conv2D(64, (3, 3), activation='relu', padding='same')(c7)
+
+    u8 = Conv2DTranspose(32, (2, 2), strides=(2, 2), padding='same')(c7)
+    u8 = Concatenate()([u8, conv2])
+    c8 = Conv2D(32, (3, 3), activation='relu', padding='same')(u8)
+    c8 = Dropout(dropoutRate)(c8)
+    c8 = Conv2D(32, (3, 3), activation='relu', padding='same')(c8)
+
+    u9 = Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same')(c8)
+    u9 = Concatenate()([u9, conv1])
+    c9 = Conv2D(16, (3, 3), activation='relu', padding='same')(u9)
+    c9 = Dropout(dropoutRate)(c9)
+    c9 = Conv2D(16, (3, 3), activation='relu', padding='same')(c9)
+
+    output_layer = Conv2D(1, (1, 1), activation='sigmoid')(c9)
+
+    model = Model(inputs=input_layer, outputs=output_layer)
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+    return model
+
+def process_reference_images(google_path, gsi_path, target_height, target_width, patch_size=32):
+    # 讀取參考影像
+    google_img = cv2.imread(google_path)
+    gsi_img = cv2.imread(gsi_path)
+    
+    print("原始 Google Map 影像尺寸:", google_img.shape)
+    print("原始 GSI 影像尺寸:", gsi_img.shape)
+    
+    # 使用 OpenCV 的 resize 函數，指定確切的目標尺寸
+    full_google = cv2.resize(google_img, (target_width, target_height), 
+                              interpolation=cv2.INTER_AREA)
+    full_gsi = cv2.resize(gsi_img, (target_width, target_height), 
+                           interpolation=cv2.INTER_AREA)
+    
+    print("縮放後 Google Map 影像尺寸:", full_google.shape)
+    print("縮放後 GSI 影像尺寸:", full_gsi.shape)
+    
+    # 正規化影像
+    google_normalized = full_google.astype(float) / 255.0
+    gsi_normalized = full_gsi.astype(float) / 255.0
+    
+    # 分割影像
+    google_patches = patchify(google_normalized, (patch_size, patch_size, 3), step=patch_size)
+    gsi_patches = patchify(gsi_normalized, (patch_size, patch_size, 3), step=patch_size)
+    
+    # 重塑補丁陣列
+    google_patches = google_patches.reshape(-1, patch_size, patch_size, 3)
+    gsi_patches = gsi_patches.reshape(-1, patch_size, patch_size, 3)
+    
+    return google_patches, gsi_patches, full_google, full_gsi
+
+def save_prediction_with_visualization(original_image, true_mask, pred_mask, google_patch, gsi_patch, save_path):
+    # 轉換多波段影像為 RGB 影像
+    def convert_to_rgb(image):
+        if image.ndim == 3 and image.shape[-1] == 8:
+            # 使用特定波段作為 RGB 通道（例如使用近紅外、紅光和綠光波段）
+            rgb_image = np.stack([
+                image[..., 5],  # 紅光波段
+                image[..., 3],  # 綠光波段
+                image[..., 1]   # 藍光波段
+            ], axis=-1)
+            
+            # 正規化到 0-1 範圍
+            rgb_normalized = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())
+            
+            # 應用 gamma 校正以增強視覺效果
+            gamma = 0.5
+            rgb_corrected = np.power(rgb_normalized, gamma)
+            
+            return rgb_corrected
+        return image
+    
+    # 處理原始影像
+    original_rgb = convert_to_rgb(original_image)
+    
+    # 處理預測遮罩的維度
+    if pred_mask.ndim == 3 and pred_mask.shape[-1] == 1:
+        pred_mask = pred_mask.squeeze()
+    
+    # 檢查遮罩維度
+    if true_mask.ndim == 1:
+        true_mask = true_mask.reshape((32, 32))
+    if true_mask.ndim == 3:
+        true_mask = true_mask[..., 0]
+    
+    # 創建視覺化圖
+    plt.figure(figsize=(20, 10))
+    
+    # 確保所有子圖都使用相同的坐標系統
+    common_extent = [0, 32, 32, 0]  # [左, 右, 上, 下]
+    
+    # 1. 轉換後的原始衛星影像
+    plt.subplot(2, 3, 1)
+    plt.imshow(original_rgb, extent=common_extent)
+    plt.title("Original Image (RGB)")
+    plt.axis('off')
+    
+    # 2. Google Map影像
+    plt.subplot(2, 3, 2)
+    plt.imshow(google_patch, extent=common_extent)
+    plt.title("Google Map Image(Before Earthquake)")
+    plt.axis('off')
+    
+    # 3. GSI影像
+    plt.subplot(2, 3, 3)
+    plt.imshow(gsi_patch, extent=common_extent)
+    plt.title("GSI Image(After Earthquake)")
+    plt.axis('off')
+    
+    # 4. 驗證遮罩
+    plt.subplot(2, 3, 4)
+    plt.imshow(true_mask, cmap="magma", extent=common_extent)
+    plt.title("Validation")
+    plt.axis('off')
+    
+    # 5. 預測遮罩
+    plt.subplot(2, 3, 5)
+    pred_mask_binary = (pred_mask > 0.5).astype(np.uint8)
+    plt.imshow(pred_mask_binary, cmap="magma", extent=common_extent)
+    plt.title("Predicted")
+    plt.axis('off')
+
+    # 輸出診斷資訊
+    print(f"預測遮罩範圍: 最小值={pred_mask.min():.3f}, 最大值={pred_mask.max():.3f}")
+    print(f"原始影像形狀: {original_image.shape}")
+    print(f"模型輸出形狀: {pred_mask_binary.shape}")
+    
+    # 儲存視覺化圖像
+    plt.tight_layout()
+    plt.savefig(save_path + "_visualization.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"分割影像已儲存至 {save_path}_visualization.png")
+
+# 資料預處理函數
+def preprocess_data(X, y):
+    # 確保輸入資料正規化到 0-1 之間
+    X_processed = np.zeros_like(X, dtype=np.float32)
+    for i in range(X.shape[-1]):
+        channel = X[..., i]
+        if channel.max() > channel.min():
+            X_processed[..., i] = (channel - channel.min()) / (channel.max() - channel.min())
+    
+    # 確保標籤是二值的
+    y_processed = (y > 0).astype(np.float32)
+    
+    return X_processed, y_processed
+
+def reconstruct_all_images(patches_pre_img, patches_post_img, patches_mask, google_patches, gsi_patches, patchsize):
+
+    # 計算完整影像尺寸
+    patch_shape = patches_pre_img.shape
+    full_height = patch_shape[0] * patchsize
+    full_width = patch_shape[1] * patchsize
+    
+    # 確保所有補丁的形狀一致
+    print("分割影像檢查：")
+    print(f"災前分割影像：{patches_pre_img.shape}")
+    print(f"Google Maps分割影像：{google_patches.shape}")
+    print(f"GSI分割影像：{gsi_patches.shape}")
+    print(f"遮罩分割影像：{patches_mask.shape}")
+    
+    # 重建原始影像
+    reconstructed_pre = unpatchify(
+        patches_pre_img.reshape(patch_shape[0], patch_shape[1], 1, patchsize, patchsize, -1),
+        (full_height, full_width, patches_pre_img.shape[-1])
+    )
+    
+    # 重建 Google Maps 影像
+    reconstructed_google = unpatchify(
+        google_patches.reshape(patch_shape[0], patch_shape[1], 1, patchsize, patchsize, 3),
+        (full_height, full_width, 3)
+    )
+    
+    # 重建 GSI 影像
+    reconstructed_gsi = unpatchify(
+        gsi_patches.reshape(patch_shape[0], patch_shape[1], 1, patchsize, patchsize, 3),
+        (full_height, full_width, 3)
+    )
+    
+    # 重建遮罩
+    reconstructed_mask = unpatchify(
+        patches_mask.reshape(patch_shape[0], patch_shape[1], patchsize, patchsize),
+        (full_height, full_width)
+    )
+    
+    return reconstructed_pre, reconstructed_google, reconstructed_gsi, reconstructed_mask
+
+def save_reconstructed_images(reconstructed_pre, reconstructed_google, reconstructed_gsi, reconstructed_mask_image, pred_mask, output_folder):    
+    """
+    儲存重建後的影像到指定的資料夾
+    """
+    # 確保資料夾存在
+    os.makedirs(output_folder, exist_ok=True)
+
+    # 修改轉換影像至RGB格式的函數
+    def convert_to_rgb(image):
+        if len(image.shape) == 2:  # 灰階影像
+            return np.stack([image] * 3, axis=-1)
+        elif image.shape[-1] == 8:  # 8波段衛星影像
+            # 使用指定的波段
+            red_channel = image[..., 5]    # Band 6: 紅光
+            green_channel = image[..., 3]  # Band 4: 綠光
+            blue_channel = image[..., 1]   # Band 2: 藍光
+            
+            # 組合RGB影像
+            rgb_image = np.stack([red_channel, green_channel, blue_channel], axis=-1)
+            
+            # 正規化到0-1範圍
+            rgb_normalized = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())
+            
+            # 套用gamma校正
+            gamma = 0.5
+            rgb_corrected = np.power(rgb_normalized, gamma)
+            
+            return rgb_corrected
+        elif image.shape[-1] == 3:  # 已經是RGB影像
+            return image
+        return image
+
+    # 檢查並轉換通道數
+    print("重建前影像形狀:", reconstructed_pre.shape) 
+    reconstructed_pre_rgb = convert_to_rgb(reconstructed_pre)
+    print("重建後RGB影像形狀:", reconstructed_pre_rgb.shape)
+    reconstructed_google_rgb = convert_to_rgb(reconstructed_google)
+    reconstructed_gsi_rgb = convert_to_rgb(reconstructed_gsi)
+        
+    # 二值化預測遮罩
+    pred_mask_binary = (pred_mask > 0.5).astype(np.uint8) * 255
+
+    print("驗證遮罩形狀:", reconstructed_mask_image.shape)
+    print("預測遮罩形狀:", pred_mask_binary.shape)
+
+    # 儲存影像
+    cv2.imwrite(os.path.join(output_folder, "reconstructed_pre_image.png"), 
+                cv2.cvtColor(reconstructed_pre_rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
+    cv2.imwrite(os.path.join(output_folder, "reconstructed_google_image.png"), 
+                cv2.cvtColor(reconstructed_google_rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
+    cv2.imwrite(os.path.join(output_folder, "reconstructed_gsi_image.png"), 
+                cv2.cvtColor(reconstructed_gsi_rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
+    cv2.imwrite(os.path.join(output_folder, "reconstructed_mask_image.png"), 
+                reconstructed_mask_image.astype(np.uint8))
+    cv2.imwrite(os.path.join(output_folder, "reconstructed_prediction_mask.png"), 
+                pred_mask_binary)
+
+    # 創建結果可視化圖像
+    plt.figure(figsize=(20, 10))
+    
+    plt.subplot(2, 3, 1)
+    plt.imshow(reconstructed_pre_rgb)
+    plt.title("Original Image")
+    plt.axis('off')
+    
+    plt.subplot(2, 3, 2)
+    plt.imshow(reconstructed_google_rgb)
+    plt.title("Google Maps Image")
+    plt.axis('off')
+    
+    plt.subplot(2, 3, 3)
+    plt.imshow(reconstructed_gsi_rgb)
+    plt.title("GSI Image")
+    plt.axis('off')
+    
+    plt.subplot(2, 3, 4)
+    plt.imshow(reconstructed_mask_image, cmap='gray')
+    plt.title("Ground Truth Mask")
+    plt.axis('off')
+    
+    plt.subplot(2, 3, 5)
+    plt.imshow(pred_mask_binary, cmap='gray')  # Now using the reshaped and binary mask
+    plt.title("Predicted Mask")
+    plt.axis('off')
+
+    # 儲存可視化結果
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, "reconstructed_visualization.png"))
+    plt.close()
+
+    print(f"所有影像已成功儲存至：{output_folder}")
+    print(f"重建的預測遮罩形狀：{pred_mask_binary.shape}")
+    
+def main():
+    patchsize = 32
+    step = patchsize
+    pre_collapse_folder = r"E:\NTOU\meeting\Wajima_pre_collapse_images"
+    post_collapse_folder = r"E:\NTOU\meeting\Wajima_post_collapse_images"
+    validation_folder = r"E:\NTOU\meeting\Wajima_validation_images"
+    output_folder = r"E:\NTOU\meeting\CNN\Wajima_visualization_results"
+    google_map_path = r"E:\NTOU\meeting\輪島Google.png"
+    gsi_map_path = r"E:\NTOU\meeting\輪島國土.png"
+
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    label_files = [f for f in os.listdir(validation_folder) if f.endswith(".tif") and "label" in f]
+    print(f"Label files: {label_files}")
+
+    # 讀取參考影像
+    google_img = cv2.imread(google_map_path)
+    gsi_img = cv2.imread(gsi_map_path)
+    
+    X_all = []
+    y_all = []
+    original_patches_all = []
+    processed_image_pairs = set()
+
+    image_combinations = itertools.product(
+        os.listdir(pre_collapse_folder),
+        os.listdir(post_collapse_folder),
+        label_files
+    )
+
+    for img_file_pre, img_file_post, label_file in image_combinations:
+        img_path_pre = os.path.join(pre_collapse_folder, img_file_pre)
+        img_path_post = os.path.join(post_collapse_folder, img_file_post)
+        label_path = os.path.join(validation_folder, label_file)
+
+        # 讀取影像
+        image_pre, _ = read_multiband_image(img_path_pre) # UTM 32653
+        image_post, _ = read_multiband_image(img_path_post) # UTM 32653
+        mask = read_mask(label_path)
+        google_img = cv2.imread(google_map_path)  # Web Mercator
+        gsi_img = cv2.imread(gsi_map_path)  # JGD2011/WGS84
+
+        # 對齊影像
+        ref_image, aligned_google, aligned_gsi = align_png_images(image_pre, google_img, gsi_img, patchsize)
+
+        # 先進行正規化
+        print("正規化前災前影像像素範圍:", image_pre.min(), image_pre.max())
+        print("正規化前災後影像像素範圍:", image_post.min(), image_post.max())
+        
+        normalized_pre = normalize_image(image_pre)
+        normalized_post = normalize_image(image_post)
+        
+        print("正規化後災前影像像素範圍:", normalized_pre.min(), normalized_pre.max())
+        print("正規化後災後影像像素範圍:", normalized_post.min(), normalized_post.max())
+
+        # 再進行切割
+        patches_pre_img = patchify(normalized_pre, (patchsize, patchsize, normalized_pre.shape[-1]), step=step)
+        patches_post_img = patchify(normalized_post, (patchsize, patchsize, normalized_post.shape[-1]), step=step)
+        patches_mask = patchify(mask, (patchsize, patchsize), step=step)
+
+        # 處理切割後的影像片段
+        X, y, original_patches = process_patches(patches_pre_img, patches_post_img, patches_mask)
+        X_all.extend(X)
+        y_all.extend(y)
+        original_patches_all.extend(original_patches)
+
+    X_all = np.array(X_all)
+    y_all = np.array(y_all)
+    original_patches_all = np.array(original_patches_all)
+    print("X all 維度：",X_all.shape)
+    print("Y all 維度：",y_all.shape)
+
+    # 重建原始影像並正規化
+    original_image = image_pre  # 直接使用完整的災前影像
+    # 提取紅、綠、藍通道
+    red_channel = original_image[..., 5]  # Band 6: 紅光
+    green_channel = original_image[..., 3]  # Band 4: 綠光
+    blue_channel = original_image[..., 1]  # Band 2: 藍光
+
+    # 將 RGB 通道疊加
+    rgb_image = np.stack([red_channel, green_channel, blue_channel], axis=-1)
+    # 正規化 RGB 通道到 [0, 1] 範圍，避免過亮或過暗
+    rgb_normalized = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())
+        
+    # 應用 gamma 校正
+    gamma = 0.5
+    rgb_corrected = np.power(rgb_normalized, gamma)
+
+    # 創建兩個圖形：一個顯示切割區域，一個顯示未切割區域
+    plt.figure(figsize=(15, 10))
+
+    # 原始影像
+    plt.subplot(2, 3, 1)
+    plt.imshow(rgb_corrected)
+    plt.title("Original Image (Full)")
+    # 切割區域的影像（使用半透明遮罩）
+    grid_image = np.copy(rgb_corrected)
+    # 創建一個遮罩來標記切割區域
+    mask_overlay = np.zeros((*grid_image.shape[:2], 4))  # RGBA遮罩
+    mask_overlay[...] = [1, 0, 0, 0.3]  # 紅色，30%透明度
+
+    # 計算有效的切割區域
+    valid_height = (original_image.shape[0] // patchsize) * patchsize
+    valid_width = (original_image.shape[1] // patchsize) * patchsize
+
+    # 標記切割區域
+    plt.subplot(2, 3, 2)
+    plt.imshow(rgb_corrected)
+    plt.imshow(mask_overlay[:valid_height, :valid_width])
+    for i in range(0, valid_height, patchsize):
+        for j in range(0, valid_width, patchsize):
+            plt.plot([j, j+patchsize], [i, i], 'w-', linewidth=0.5)
+            plt.plot([j, j], [i, i+patchsize], 'w-', linewidth=0.5)
+    plt.title("Patched Area (Red)")
+
+    # 切割後的驗證遮罩
+    validation_mask_colored = np.zeros((*mask.shape, 3))
+
+    # 將切割區域內的驗證標籤著色為藍色
+    validation_mask_colored[:valid_height, :valid_width] = np.stack([
+        np.zeros_like(mask[:valid_height, :valid_width]),  # R
+        np.zeros_like(mask[:valid_height, :valid_width]),  # G
+        mask[:valid_height, :valid_width],  # B
+    ], axis=-1)
+
+    plt.subplot(2, 3, 3)
+    plt.imshow(validation_mask_colored)
+    for i in range(0, valid_height, patchsize):
+        for j in range(0, valid_width, patchsize):
+            plt.plot([j, j+patchsize], [i, i], 'w-', linewidth=0.5)
+            plt.plot([j, j], [i, i+patchsize], 'w-', linewidth=0.5)
+    plt.title("Patched Validation Mask (Blue)")
+
+    # 未切割區域的影像
+    unpatched_mask = np.ones_like(rgb_corrected)
+    unpatched_mask[:valid_height, :valid_width] = 0
+    plt.subplot(2, 3, 5)
+    unpatched_image = np.copy(rgb_corrected)
+    unpatched_image[unpatched_mask == 0] = 0  # 將切割區域設為黑色
+    plt.imshow(unpatched_image)
+    plt.title("Unpatched Area")
+
+    # 未切割區域的驗證遮罩
+    unpatched_validation = np.copy(mask)
+    unpatched_validation[:valid_height, :valid_width] = 0
+    plt.subplot(2, 3, 6)
+    plt.imshow(unpatched_validation, cmap='gray')
+    plt.title("Unpatched Validation Mask")
+
+    plt.tight_layout()
+    plt.show()
+
+    # 輸出切割和未切割區域的尺寸資訊
+    print(f"原始影像尺寸: {original_image.shape}")
+    print(f"切割區域尺寸: {valid_height} x {valid_width}")
+    print(f"未切割區域: 底部 {original_image.shape[0] - valid_height} 像素")
+    print(f"未切割區域: 右側 {original_image.shape[1] - valid_width} 像素")
+
+    # 訓練集、驗證集、測試集劃分
+    X_train_val, X_test, y_train_val, y_test, original_train_val, original_test = train_test_split(
+        X_all, y_all, original_patches_all, test_size=0.2, random_state=0)
+    
+    X_train, X_val, y_train, y_val, original_train, original_val = train_test_split(
+        X_train_val, y_train_val, original_train_val, test_size=0.25, random_state=0)
+
+    # 建立和訓練模型
+    input_shape = (patchsize, patchsize, X_train.shape[-1])
+    model = build_unet(input_shape=(32, 32, 8))  # Move this line before using model
+
+    # Then preprocess data
+    X_train_processed, y_train_processed = preprocess_data(X_train, y_train)
+    X_val_processed, y_val_processed = preprocess_data(X_val, y_val)
+
+    history = model.fit(
+        X_train_processed, y_train_processed,
+        validation_data=(X_val_processed, y_val_processed),
+        batch_size=32,
+        epochs=50,
+        verbose=2
+    )    
+
+    print("處理參考影像...")
+    google_patches, gsi_patches, full_google, full_gsi = process_reference_images(
+        google_map_path,  # 使用之前定義的路徑變數
+        gsi_map_path,    # 使用之前定義的路徑變數
+        target_height=valid_height,
+        target_width=valid_width,
+        patch_size=patchsize
+    )
+    # 進行預測
+    X_test_processed, _ = preprocess_data(X_test, y_test)
+    predictions = model.predict(X_test_processed)
+
+    print("predictions原始形狀:", predictions.shape)
+    print("patches_mask形狀:", patches_mask.shape)
+
+    # 修正重建預測結果的形狀
+    if predictions.shape[-1] == 1:  # 如果預測結果包含channel維度
+        predictions = predictions.squeeze()  # 移除最後的channel維度
+
+    # 使用修改後的重建函數
+    reconstructed_predictions = reconstruct_predictions(
+        predictions, 
+        (patches_mask.shape[0] * patchsize, patches_mask.shape[1] * patchsize),  # 目標尺寸
+        patchsize
+    )
+        
+    # 統一重建所有影像
+    reconstructed_pre, reconstructed_google, reconstructed_gsi, reconstructed_mask = \
+        reconstruct_all_images(patches_pre_img, patches_post_img, patches_mask, 
+                             google_patches, gsi_patches, patchsize)
+    
+    print("重建後預測形狀:", reconstructed_predictions.shape)
+    print("目標遮罩形狀:", reconstructed_mask.shape)
+
+    print("訓練資料形狀：", X_train_processed.shape)
+    print("訓練標籤形狀：", y_train_processed.shape)
+    print("訓練資料範圍：", X_train_processed.min(), X_train_processed.max())
+    print("訓練標籤範圍：", y_train_processed.min(), y_train_processed.max())
+
+    # 預測和評估
+    y_pred = model.predict(X_val)
+    print("y_pred.shape：",y_pred.shape)
+
+    y_pred = y_pred.squeeze()  
+    print("移除多餘的維度後的 y_pred：",y_pred.shape)
+    prediction = (y_pred > 0.5).astype(np.uint8)
+    print("\nChecking shapes before visualization:")
+    
+    print(f"X_val shape: {X_val.shape}")
+    print("X_train.shape：", X_train.shape)
+    print(f"X_test shape: {X_test.shape}")
+
+    print(f"y_val shape: {y_val.shape}")
+    print("y_train.shape:", y_train.shape)
+    print(f"y_test shape: {y_test.shape}")
+    print(f"y_pred shape: {prediction.shape}")
+    print(f"y_pred[{i}] min/max: {y_pred[i].min()}/{y_pred[i].max()}")
+
+    # 在訓練過程中添加以下檢查點
+    print("檢查資料範圍：")
+    print(f"X_train 範圍：[{X_train.min():.3f}, {X_train.max():.3f}]")
+    print(f"y_train 範圍：[{y_train.min():.3f}, {y_train.max():.3f}]")
+    y_pred = model.predict(X_val_processed)
+    print(f"預測值範圍：[{y_pred.min():.3f}, {y_pred.max():.3f}]")
+
+    # 儲存重建的影像和預測結果
+    save_reconstructed_images(
+        reconstructed_pre, 
+        reconstructed_google,  
+        reconstructed_gsi, 
+        reconstructed_mask, 
+        reconstructed_predictions,  # 使用重建後的預測結果
+        output_folder
+    )
+    
+    print(f"重建影像已儲存至 {output_folder}")
+
+    # 在進行預測可視化時
+    for i in range(len(X_val)):
+        save_path = os.path.join(output_folder, f"prediction_{i+1}.png")
+        # 使用對應的 Google 和國土補丁
+        google_patch = google_patches[i] if i < len(google_patches) else google_patches[0]
+        gsi_patch = gsi_patches[i] if i < len(gsi_patches) else gsi_patches[0]
+        
+        save_prediction_with_visualization(
+            original_val[i],      # 原始影像
+            y_val[i],            # 真實遮罩
+            y_pred[i],           # 預測遮罩
+            google_patch,       # Google Map 
+            gsi_patch,        # 國土
+            save_path
+        )
+
+    # 繪製訓練過程中的損失和準確度曲線
+    loss = history.history['loss']
+    val_loss = history.history['val_loss']
+    acc = history.history['accuracy']
+    val_acc = history.history['val_accuracy']
+    
+    df_history = pd.DataFrame({'loss': loss, 'val_loss': val_loss, 'acc': acc, 'val_acc': val_acc})
+    epochs = range(1, len(loss) + 1)
+    
+    # 損失曲線
+    plt.rcParams.update(plt.rcParamsDefault)
+    plt.plot(epochs, loss, 'o-', label='Training', markersize=5, color='#4f6b8d')  # 'o-' adds a circle marker
+    plt.plot(epochs, val_loss, 'o-', label='Validation', markersize=5, color='#cf3832')  # 'o-' adds a circle marker
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend(fontsize='large')  # Set the legend font size to large
+    plt.grid(linestyle='--')
+    plt.tight_layout(pad=1.0)
+    plt.show()
+    
+    # 準確度曲線
+    plt.plot(epochs, acc, 'o-', label='Training', markersize=5, color='#4f6b8d')  # 'o-' adds a circle marker
+    plt.plot(epochs, val_acc, 'o-', label='Validation', markersize=5, color='#cf3832')  # 'o-' adds a circle marker
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend(fontsize='large')  # Set the legend font size to large
+    plt.grid(linestyle='--')
+    plt.tight_layout(pad=1.0)
+    plt.show()
+
+    # 繪製訓練歷史
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Model Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, 'training_history.png'))
+    plt.close()
+
+if __name__ == "__main__":
+    main()
